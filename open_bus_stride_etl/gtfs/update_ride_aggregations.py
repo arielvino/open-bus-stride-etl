@@ -3,7 +3,9 @@ from pprint import pprint
 from textwrap import dedent
 from collections import defaultdict
 
-from open_bus_stride_db import model, db
+from sqlalchemy import text
+
+from open_bus_stride_db import db
 
 from .. import common, idempotent_process_gtfs_data
 
@@ -23,33 +25,63 @@ def _process_date_range(from_date, to_date):
         dt = dt - datetime.timedelta(days=1)
 
 
+# One set-based statement per date. The previous version walked the date's rides through the
+# ORM, lazy-loading each ride's stops and issuing two more lookups per ride - ~60k rides a day
+# means a few hundred thousand round trips, enough to leave a day's gtfs_ride.start_time null
+# well into the day it describes (2026-10-08: still null at 20:00 Israel time).
+# A ride without stops gets nulls, same as before (the LEFT JOINs find nothing).
+UPDATE_RIDE_AGGREGATIONS = """
+    WITH rides AS (
+        SELECT gtfs_ride.id
+        FROM gtfs_ride
+        JOIN gtfs_route ON gtfs_route.id = gtfs_ride.gtfs_route_id
+        WHERE gtfs_route.date = :date
+    ), first_stops AS (
+        SELECT DISTINCT ON (gtfs_ride_stop.gtfs_ride_id)
+            gtfs_ride_stop.gtfs_ride_id, gtfs_ride_stop.id, gtfs_ride_stop.departure_time
+        FROM gtfs_ride_stop
+        JOIN rides ON rides.id = gtfs_ride_stop.gtfs_ride_id
+        ORDER BY gtfs_ride_stop.gtfs_ride_id, gtfs_ride_stop.stop_sequence ASC, gtfs_ride_stop.id ASC
+    ), last_stops AS (
+        SELECT DISTINCT ON (gtfs_ride_stop.gtfs_ride_id)
+            gtfs_ride_stop.gtfs_ride_id, gtfs_ride_stop.id, gtfs_ride_stop.arrival_time
+        FROM gtfs_ride_stop
+        JOIN rides ON rides.id = gtfs_ride_stop.gtfs_ride_id
+        ORDER BY gtfs_ride_stop.gtfs_ride_id, gtfs_ride_stop.stop_sequence DESC, gtfs_ride_stop.id DESC
+    ), updated AS (
+        UPDATE gtfs_ride
+        SET
+            first_gtfs_ride_stop_id = first_stops.id,
+            last_gtfs_ride_stop_id = last_stops.id,
+            start_time = first_stops.departure_time,
+            end_time = last_stops.arrival_time
+        FROM rides
+        LEFT JOIN first_stops ON first_stops.gtfs_ride_id = rides.id
+        LEFT JOIN last_stops ON last_stops.gtfs_ride_id = rides.id
+        WHERE gtfs_ride.id = rides.id
+        RETURNING gtfs_ride.first_gtfs_ride_stop_id, gtfs_ride.last_gtfs_ride_stop_id
+    )
+    SELECT
+        COUNT(*) AS total_rides,
+        COUNT(*) FILTER (WHERE first_gtfs_ride_stop_id = last_gtfs_ride_stop_id) AS same_first_last,
+        COUNT(*) FILTER (WHERE first_gtfs_ride_stop_id <> last_gtfs_ride_stop_id) AS valid_first_last,
+        COUNT(*) FILTER (WHERE first_gtfs_ride_stop_id IS NULL) AS without_first_last
+    FROM updated
+"""
+
+
 @db.session_decorator
 def _process_date(session: db.Session, date, stats=None, silent=False):
     date = common.parse_date_str(date)
     print("Updating ride aggregations for date {}".format(date))
     if stats is None:
         stats = defaultdict(int)
-    for gtfs_ride in session.query(model.GtfsRide).join(model.GtfsRoute.gtfs_rides).where(model.GtfsRoute.date == date):
-        stats['total rides'] += 1
-        gtfs_ride_stops = sorted(gtfs_ride.gtfs_ride_stops,
-                                 key=lambda gtfs_ride_stop: gtfs_ride_stop.stop_sequence)
-        if len(gtfs_ride_stops) > 0:
-            gtfs_ride.first_gtfs_ride_stop_id = gtfs_ride_stops[0].id
-            gtfs_ride.last_gtfs_ride_stop_id = gtfs_ride_stops[-1].id
-            if gtfs_ride.first_gtfs_ride_stop_id == gtfs_ride.last_gtfs_ride_stop_id:
-                stats['rides with same first/last stop'] += 1
-            else:
-                stats['rides with valid first/last stops'] += 1
-            gtfs_ride.start_time = session.query(model.GtfsRideStop).get(
-                gtfs_ride.first_gtfs_ride_stop_id).departure_time
-            gtfs_ride.end_time = session.query(model.GtfsRideStop).get(gtfs_ride.last_gtfs_ride_stop_id).arrival_time
-        else:
-            stats['rides without first/last stops'] += 1
-            gtfs_ride.first_gtfs_ride_stop_id = None
-            gtfs_ride.last_gtfs_ride_stop_id = None
-            gtfs_ride.start_time = None
-            gtfs_ride.end_time = None
+    row = session.execute(text(UPDATE_RIDE_AGGREGATIONS), {'date': date}).one()
     session.commit()
+    stats['total rides'] += row.total_rides
+    stats['rides with same first/last stop'] += row.same_first_last
+    stats['rides with valid first/last stops'] += row.valid_first_last
+    stats['rides without first/last stops'] += row.without_first_last
     if not silent:
         pprint(dict(stats))
     return stats
